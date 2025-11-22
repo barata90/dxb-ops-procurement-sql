@@ -252,7 +252,6 @@ table
 schema
 ├── docs/
 │   ├── schema_public.png              # ER diagram screenshots 
-(optional)
 │   ├── schema_dxb_ops.png
 │   ├── schema_eng_proc.png
 │   └── sample_queries.png
