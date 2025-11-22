@@ -239,17 +239,21 @@ factor in reliability and interruption costs, the OEM baseline is **~470k cheape
 This is exactly the type of analysis a **Procurement Analyst – Engineering** role would perform.
 
 ---
+To open the full SQL lab:
+- Download General-20251122.dbp (click the file, then Download raw).
+- Open DBeaver → File → Import → DBeaver → Project.
+- Select the .dbp file and import.
+This will load all connections, ER diagrams, and SQL scripts used in the lab.
+
+---
 
 ## 4. Repository Structure
 
 ```text
 ├── sql/
-│   ├── 01_public_dxb_ops.sql          # flights, baggage, rosters, 
-etc.
-│   ├── 02_dxb_ops_flight_stability.sql # flights_live/history + fact 
-table
-│   └── 03_eng_proc_lcc.sql            # procurement & life-cycle cost 
-schema
+│   ├── 01_public_dxb_ops.sql          # flights, baggage, rosters, etc.
+│   ├── 02_dxb_ops_flight_stability.sql # flights_live/history + fact table
+│   └── 03_eng_proc_lcc.sql            # procurement & life-cycle cost schema
 ├── docs/
 │   ├── schema_public.png              # ER diagram screenshots 
 │   ├── schema_dxb_ops.png
