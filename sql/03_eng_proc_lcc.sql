@@ -1,4 +1,29 @@
+-- =========================================================
+-- 03_eng_proc_lcc.sql  (fixed for psql/Jupyter)
+-- Engineering Procurement & Life-Cycle Cost (LCC) Mini-Mart
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- A. CLEANUP & SCHEMA
+-- ---------------------------------------------------------
+
 CREATE SCHEMA IF NOT EXISTS eng_proc;
+
+-- bersihkan supaya script idempotent
+DROP TABLE IF EXISTS eng_proc.lcc_npv;
+DROP TABLE IF EXISTS eng_proc.lcc_scenarios;
+DROP TABLE IF EXISTS eng_proc.interruptions;
+DROP TABLE IF EXISTS eng_proc.part_usage_monthly;
+DROP TABLE IF EXISTS eng_proc.po_lines;
+DROP TABLE IF EXISTS eng_proc.po_headers;
+DROP TABLE IF EXISTS eng_proc.contract_prices;
+DROP TABLE IF EXISTS eng_proc.contracts;
+DROP TABLE IF EXISTS eng_proc.parts;
+DROP TABLE IF EXISTS eng_proc.suppliers;
+
+-- ---------------------------------------------------------
+-- B. MASTER TABLES
+-- ---------------------------------------------------------
 
 -- 1) Supplier master
 CREATE TABLE eng_proc.suppliers (
@@ -6,8 +31,7 @@ CREATE TABLE eng_proc.suppliers (
     supplier_code    VARCHAR(20) UNIQUE NOT NULL,
     supplier_name    VARCHAR(100) NOT NULL,
     region           VARCHAR(20),          -- EMEA / APAC / etc
-    oem_flag         BOOLEAN,              -- true kalau OEM, false kalau 
-MRO/independent
+    oem_flag         BOOLEAN,              -- true kalau OEM, false kalau MRO/independent
     quality_rating   NUMERIC(3,1),         -- 1-5 (internal score)
     on_time_rating   NUMERIC(3,1)          -- 1-5
 );
@@ -93,6 +117,86 @@ CREATE TABLE eng_proc.interruptions (
     root_cause       VARCHAR(50)           -- TECH / LOG / SUPP CHAIN etc
 );
 
+-- ---------------------------------------------------------
+-- C. MINIMAL SEED DATA UNTUK DEMO
+-- ---------------------------------------------------------
+
+-- suppliers & part utama
+INSERT INTO eng_proc.suppliers (
+    supplier_code, supplier_name, region, oem_flag, quality_rating, on_time_rating
+) VALUES
+    ('OEM_A',  'OEM Aero Systems',      'EU',  TRUE,  4.5, 4.2),
+    ('MRO_X',  'MRO X Dubai',           'MEA', FALSE, 4.0, 3.8)
+ON CONFLICT (supplier_code) DO NOTHING;
+
+INSERT INTO eng_proc.parts (
+    part_number, description, ata_chapter, aircraft_family, repairable_flag, uom
+) VALUES
+    ('BRAKE-A380', 'A380 Brake Unit', '32', 'A380', TRUE, 'EA')
+ON CONFLICT (part_number) DO NOTHING;
+
+-- kontrak contoh
+INSERT INTO eng_proc.contracts (
+    supplier_id, contract_code, start_date, end_date,
+    currency, discount_pct, warranty_months, pbth_flag, remarks
+)
+SELECT s.supplier_id, 'OEM_A_2025', DATE '2025-01-01', DATE '2030-12-31',
+       'USD', 0.00, 24, FALSE, 'OEM long-term brake support'
+FROM eng_proc.suppliers s
+WHERE s.supplier_code = 'OEM_A'
+ON CONFLICT (contract_code) DO NOTHING;
+
+INSERT INTO eng_proc.contracts (
+    supplier_id, contract_code, start_date, end_date,
+    currency, discount_pct, warranty_months, pbth_flag, remarks
+)
+SELECT s.supplier_id, 'MRO_X_2025', DATE '2025-01-01', DATE '2030-12-31',
+       'USD', 0.00, 12, FALSE, 'MRO alternative support'
+FROM eng_proc.suppliers s
+WHERE s.supplier_code = 'MRO_X'
+ON CONFLICT (contract_code) DO NOTHING;
+
+-- harga kontrak per part
+INSERT INTO eng_proc.contract_prices (
+    contract_id, part_id, effective_from, effective_to, unit_price, currency
+)
+SELECT c.contract_id, p.part_id, DATE '2025-01-01', NULL, 120000.0, 'USD'
+FROM eng_proc.contracts c
+JOIN eng_proc.suppliers s ON s.supplier_id = c.supplier_id
+JOIN eng_proc.parts     p ON p.part_number = 'BRAKE-A380'
+WHERE s.supplier_code = 'OEM_A'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO eng_proc.contract_prices (
+    contract_id, part_id, effective_from, effective_to, unit_price, currency
+)
+SELECT c.contract_id, p.part_id, DATE '2025-01-01', NULL,  90000.0, 'USD'
+FROM eng_proc.contracts c
+JOIN eng_proc.suppliers s ON s.supplier_id = c.supplier_id
+JOIN eng_proc.parts     p ON p.part_number = 'BRAKE-A380'
+WHERE s.supplier_code = 'MRO_X'
+ON CONFLICT DO NOTHING;
+
+-- sedikit data usage supaya ada MTBUR
+INSERT INTO eng_proc.part_usage_monthly (
+    part_id, aircraft_family, year_month, flight_hours, flight_cycles, removals
+)
+SELECT p.part_id, 'A380', DATE '2025-01-01', 2000, 500, 1
+FROM eng_proc.parts p
+WHERE p.part_number = 'BRAKE-A380'
+ON CONFLICT (part_id, year_month) DO NOTHING;
+
+INSERT INTO eng_proc.part_usage_monthly (
+    part_id, aircraft_family, year_month, flight_hours, flight_cycles, removals
+)
+SELECT p.part_id, 'A380', DATE '2025-02-01', 2200, 550, 1
+FROM eng_proc.parts p
+WHERE p.part_number = 'BRAKE-A380'
+ON CONFLICT (part_id, year_month) DO NOTHING;
+
+-- ---------------------------------------------------------
+-- D. RELIABILITY & DIRECT MAINT COST PER FH
+-- ---------------------------------------------------------
 
 WITH usage AS (
     SELECT
@@ -126,7 +230,6 @@ SELECT
     s.supplier_name,
     f.fh_per_failure,
     a.avg_price,
-    -- assume setiap failure perlu 1 unit
     a.avg_price / f.fh_per_failure AS dmc_per_fh
 FROM fail_rate f
 JOIN avg_price a USING (part_id)
@@ -134,9 +237,13 @@ JOIN eng_proc.parts p USING (part_id)
 JOIN eng_proc.suppliers s ON s.supplier_id = a.supplier_id
 WHERE f.fh_per_failure IS NOT NULL;
 
+-- ---------------------------------------------------------
+-- E. LCC SCENARIO TABLE
+-- ---------------------------------------------------------
+
 CREATE TABLE eng_proc.lcc_scenarios (
     scenario_id      SERIAL PRIMARY KEY,
-    scenario_name    VARCHAR(50),
+    scenario_name    VARCHAR(50) UNIQUE,
     part_id          INT REFERENCES eng_proc.parts(part_id),
     supplier_id      INT REFERENCES eng_proc.suppliers(supplier_id),
     horizon_years    INT,
@@ -147,71 +254,6 @@ CREATE TABLE eng_proc.lcc_scenarios (
     annual_esc_pct   NUMERIC(5,2),    -- price escalation %
     interrupt_cost_per_event NUMERIC(14,4)  -- cost of one AOG/interrupt
 );
-
-WITH cashflows AS (
-    SELECT
-        s.scenario_id,
-        year,
-        -- expected failures per year = annual_fh / fh_per_failure
-        (s.annual_fh / s.fh_per_failure) AS failures_per_year,
-        -- unit price per year with escalation
-        s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, year-1) AS 
-unit_price_year,
-        -- material cost per year
-        (s.annual_fh / s.fh_per_failure) 
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1) AS material_cost,
-        -- interruption cost (misal setiap failure → 1 event)
-        (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event AS 
-interrupt_cost,
-        -- total nominal cash out
-        (s.annual_fh / s.fh_per_failure) 
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1)
-          + (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event 
-AS total_cost
-    FROM eng_proc.lcc_scenarios s
-    CROSS JOIN LATERAL generate_series(1, s.horizon_years) AS year
-),
-npv AS (
-    SELECT
-        c.scenario_id,
-        SUM(c.total_cost / POWER(1 + s.discount_rate, c.year)) AS 
-npv_total_cost
-    FROM cashflows c
-    JOIN eng_proc.lcc_scenarios s USING (scenario_id)
-    GROUP BY c.scenario_id
-)
-SELECT
-    s.scenario_name,
-    p.part_number,
-    sup.supplier_name,
-    n.npv_total_cost
-FROM npv n
-JOIN eng_proc.lcc_scenarios s USING (scenario_id)
-JOIN eng_proc.parts p ON p.part_id = s.part_id
-JOIN eng_proc.suppliers sup ON sup.supplier_id = s.supplier_id
-ORDER BY n.npv_total_cost;
-
-
-SELECT * FROM eng_proc.lcc_scenarios;
-
-INSERT INTO eng_proc.suppliers (
-    supplier_code, supplier_name, region, oem_flag, quality_rating, 
-on_time_rating
-) VALUES
-    ('OEM_A',  'OEM Aero Systems',      'EU',  TRUE,  4.5, 4.2),
-    ('MRO_X',  'MRO X Dubai',           'MEA', FALSE, 4.0, 3.8)
-ON CONFLICT (supplier_code) DO NOTHING;
-
-
-INSERT INTO eng_proc.parts (
-    part_number, description, ata_chapter, aircraft_family, 
-repairable_flag, uom
-) VALUES
-    ('BRAKE-A380', 'A380 Brake Unit', '32', 'A380', TRUE, 'EA')
-ON CONFLICT (part_number) DO NOTHING;
-
 
 -- Skenario 1: OEM_A – harga mahal, reliabilitas bagus
 INSERT INTO eng_proc.lcc_scenarios (
@@ -239,7 +281,8 @@ SELECT
     20000        -- tiap interrupt biaya 20k
 FROM eng_proc.parts p, eng_proc.suppliers s
 WHERE p.part_number = 'BRAKE-A380'
-  AND s.supplier_code = 'OEM_A';
+  AND s.supplier_code = 'OEM_A'
+ON CONFLICT (scenario_name) DO NOTHING;
 
 -- Skenario 2: MRO_X – harga lebih murah, reliabilitas lebih jelek
 INSERT INTO eng_proc.lcc_scenarios (
@@ -267,103 +310,72 @@ SELECT
     20000
 FROM eng_proc.parts p, eng_proc.suppliers s
 WHERE p.part_number = 'BRAKE-A380'
-  AND s.supplier_code = 'MRO_X';
+  AND s.supplier_code = 'MRO_X'
+ON CONFLICT (scenario_name) DO NOTHING;
 
+-- cek isi scenarios
 SELECT scenario_id, scenario_name
-FROM eng_proc.lcc_scenarios;
+FROM eng_proc.lcc_scenarios
+ORDER BY scenario_id;
 
+-- ---------------------------------------------------------
+-- F. CASHFLOWS & NPV (PERSIST SEBAGAI TABLE eng_proc.lcc_npv)
+-- ---------------------------------------------------------
 
+DROP TABLE IF EXISTS eng_proc.lcc_npv;
+
+CREATE TABLE eng_proc.lcc_npv AS
 WITH cashflows AS (
     SELECT
         s.scenario_id,
-        year,
+        generate_series(1, s.horizon_years) AS year,
         (s.annual_fh / s.fh_per_failure) AS failures_per_year,
-        s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, year-1) AS 
-unit_price_year,
-        (s.annual_fh / s.fh_per_failure) 
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1) AS material_cost,
-        (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event AS 
-interrupt_cost,
-        (s.annual_fh / s.fh_per_failure) 
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1)
-          + (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event 
-AS total_cost
+        s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0,
+                                  generate_series(1, s.horizon_years)-1) AS unit_price_year,
+        (s.annual_fh / s.fh_per_failure)
+            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0,
+                                        generate_series(1, s.horizon_years)-1) AS material_cost,
+        (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event AS interrupt_cost,
+        (s.annual_fh / s.fh_per_failure)
+            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0,
+                                        generate_series(1, s.horizon_years)-1)
+          + (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event AS total_cost,
+        s.discount_rate
     FROM eng_proc.lcc_scenarios s
-    CROSS JOIN LATERAL generate_series(1, s.horizon_years) AS year
 ),
 npv AS (
     SELECT
-        c.scenario_id,
-        SUM(c.total_cost / POWER(1 + s.discount_rate, c.year)) AS 
-npv_total_cost
-    FROM cashflows c
-    JOIN eng_proc.lcc_scenarios s USING (scenario_id)
-    GROUP BY c.scenario_id
+        scenario_id,
+        SUM(total_cost / POWER(1 + discount_rate, year)) AS npv_total_cost
+    FROM cashflows
+    GROUP BY scenario_id
 )
+SELECT * FROM npv;
+
+-- indeks kecil
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lcc_npv_scenario
+ON eng_proc.lcc_npv (scenario_id);
+
+-- view hasil gabungan yang enak untuk Python
+-- (atau langsung SELECT join di bawah dari Jupyter)
+-- SELECT * FROM eng_proc.lcc_npv;  -- kalau mau lihat raw
+
 SELECT
     s.scenario_name,
     p.part_number,
     sup.supplier_name,
     n.npv_total_cost
-FROM npv n
+FROM eng_proc.lcc_npv n
 JOIN eng_proc.lcc_scenarios s USING (scenario_id)
 JOIN eng_proc.parts p ON p.part_id = s.part_id
 JOIN eng_proc.suppliers sup ON sup.supplier_id = s.supplier_id
 ORDER BY n.npv_total_cost;
 
+-- ---------------------------------------------------------
+-- G. OPS ANALYTICS (TURNAROUND & STAFFING)
+-- ---------------------------------------------------------
 
-SELECT *
-FROM eng_proc.lcc_scenarios
-ORDER BY scenario_id;
-
-
-WITH cashflows AS (
-    SELECT
-        s.scenario_name,
-        year,
-        (s.annual_fh / s.fh_per_failure) AS failures_per_year,
-        s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, year-1) AS 
-unit_price_year,
-        (s.annual_fh / s.fh_per_failure) 
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1) AS material_cost,
-        (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event AS 
-interrupt_cost,
-        (s.annual_fh / s.fh_per_failure) 
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1)
-          + (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event 
-AS total_cost
-    FROM eng_proc.lcc_scenarios s
-    CROSS JOIN LATERAL generate_series(1, s.horizon_years) AS year
-)
-SELECT *
-FROM cashflows
-WHERE scenario_name IN ('OEM_A baseline', 'MRO_X aggressive')
-ORDER BY scenario_name, year;
-
-
--- Simpan hanya scenario_id terkecil untuk MRO_X, hapus yang lain
-DELETE FROM eng_proc.lcc_scenarios
-WHERE scenario_name = 'MRO_X aggressive'
-  AND scenario_id <> (
-      SELECT MIN(scenario_id)
-      FROM eng_proc.lcc_scenarios
-      WHERE scenario_name = 'MRO_X aggressive'
-  );
-
-SELECT scenario_id, scenario_name
-FROM eng_proc.lcc_scenarios
-ORDER BY scenario_id;
-
-
-ALTER TABLE eng_proc.lcc_scenarios
-ADD CONSTRAINT uq_lcc_scenario_name UNIQUE (scenario_name);
-
-
--- Average turnaround (ATA → ATD) per airline
+-- Average turnaround (ATA → ATD) per airline dari dataset publik
 SELECT
     airline_code,
     COUNT(*) AS flights,
@@ -376,7 +388,7 @@ WHERE ata IS NOT NULL
 GROUP BY airline_code
 ORDER BY avg_turnaround_min;
 
-
+-- Demand vs supply untuk ground staff per jam
 WITH demand AS (
     SELECT
         DATE(start_time) AS ops_date,
@@ -401,54 +413,10 @@ SELECT
     d.role,
     d.total_required_staff,
     COALESCE(s.available_staff, 0) AS available_staff,
-    COALESCE(s.available_staff, 0) - d.total_required_staff AS 
-staffing_gap
+    COALESCE(s.available_staff, 0) - d.total_required_staff AS staffing_gap
 FROM demand d
 LEFT JOIN supply s
   ON d.ops_date  = s.ops_date
  AND d.hour_slot = s.hour_slot
  AND d.role      = s.role
 ORDER BY d.ops_date, d.hour_slot, d.role;
-
-
-
-WITH cashflows AS (
-    SELECT
-        s.scenario_id,
-        year,
-        (s.annual_fh / s.fh_per_failure) AS failures_per_year,
-        s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, year-1) AS 
-unit_price_year,
-        (s.annual_fh / s.fh_per_failure)
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1) AS material_cost,
-        (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event AS 
-interrupt_cost,
-        (s.annual_fh / s.fh_per_failure)
-            * s.base_unit_price * POWER(1 + s.annual_esc_pct/100.0, 
-year-1)
-          + (s.annual_fh / s.fh_per_failure) * s.interrupt_cost_per_event 
-AS total_cost
-    FROM eng_proc.lcc_scenarios s
-    CROSS JOIN LATERAL generate_series(1, s.horizon_years) AS year
-),
-npv AS (
-    SELECT
-        c.scenario_id,
-        SUM(c.total_cost / POWER(1 + s.discount_rate, c.year)) AS 
-npv_total_cost
-    FROM cashflows c
-    JOIN eng_proc.lcc_scenarios s USING (scenario_id)
-    GROUP BY c.scenario_id
-)
-SELECT
-    s.scenario_name,
-    p.part_number,
-    sup.supplier_name,
-    n.npv_total_cost
-FROM npv n
-JOIN eng_proc.lcc_scenarios s USING (scenario_id)
-JOIN eng_proc.parts p ON p.part_id = s.part_id
-JOIN eng_proc.suppliers sup ON sup.supplier_id = s.supplier_id
-ORDER BY n.npv_total_cost;
-

@@ -1,9 +1,16 @@
+-- =========================================================
+-- 02_dxb_ops_flight_stability.sql  (fixed for psql/Jupyter)
+-- Membangun SCD2-style history + fact_flight_stability
+-- =========================================================
+
 -- =========================================
 -- A. SCHEMA & TABLES
 -- =========================================
 
 CREATE SCHEMA IF NOT EXISTS dxb_ops;
 
+-- bersihkan dulu supaya repeatable
+DROP TABLE IF EXISTS dxb_ops.fact_flight_stability;
 DROP TABLE IF EXISTS dxb_ops.flights_history;
 DROP TABLE IF EXISTS dxb_ops.flights_live;
 
@@ -23,8 +30,8 @@ CREATE TABLE dxb_ops.flights_live (
     atd             TIMESTAMP,  -- actual departure
     ata             TIMESTAMP,  -- actual arrival
 
-    status_code     VARCHAR(20),  -- SCHED / BOARDING / DEPARTED / ARRIVED 
-/ CANCELLED
+    -- contoh nilai: SCHED / BOARDING / DEPARTED / ARRIVED / CANCELLED
+    status_code     VARCHAR(20),
     gate            VARCHAR(10),
     stand           VARCHAR(10),
     terminal_code   VARCHAR(5),
@@ -35,8 +42,7 @@ CREATE TABLE dxb_ops.flights_live (
 -- Tabel history (semua perubahan pada flight)
 CREATE TABLE dxb_ops.flights_history (
     history_id      BIGSERIAL PRIMARY KEY,
-    flight_id       BIGINT NOT NULL REFERENCES 
-dxb_ops.flights_live(flight_id),
+    flight_id       BIGINT NOT NULL REFERENCES dxb_ops.flights_live(flight_id),
 
     flight_number   VARCHAR(10) NOT NULL,
     op_date         DATE        NOT NULL,
@@ -61,6 +67,9 @@ dxb_ops.flights_live(flight_id),
     changed_by      VARCHAR(50)
 );
 
+CREATE INDEX idx_flights_history_flight_validfrom
+ON dxb_ops.flights_history (flight_id, valid_from);
+
 -- =========================================
 -- B. TRIGGER UNTUK MENGISI HISTORY
 -- =========================================
@@ -68,49 +77,43 @@ dxb_ops.flights_live(flight_id),
 CREATE OR REPLACE FUNCTION dxb_ops.flights_live_audit()
 RETURNS trigger AS
 $$
+DECLARE
+    v_change_reason text;
 BEGIN
-    -- Saat INSERT: buat snapshot awal
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO dxb_ops.flights_history (
-            flight_id, flight_number, op_date, airline_code, origin, 
-destination,
-            std, sta, etd, eta, atd, ata, status_code, gate, stand, 
-terminal_code,
-            valid_from, valid_to, change_reason, changed_by
-        )
-        VALUES (
-            NEW.flight_id, NEW.flight_number, NEW.op_date, 
-NEW.airline_code, NEW.origin, NEW.destination,
-            NEW.std, NEW.sta, NEW.etd, NEW.eta, NEW.atd, NEW.ata, 
-NEW.status_code, NEW.gate, NEW.stand, NEW.terminal_code,
-            now(), NULL, 'INSERT', current_user
-        );
-        RETURN NEW;
-    END IF;
+        v_change_reason := 'INSERT';
+    ELSE
+        -- deteksi jenis perubahan saat UPDATE
+        IF NEW.etd IS DISTINCT FROM OLD.etd THEN
+            v_change_reason := 'ETD_CHANGE';
+        ELSIF NEW.status_code IS DISTINCT FROM OLD.status_code THEN
+            v_change_reason := 'STATUS_CHANGE';
+        ELSIF NEW.gate IS DISTINCT FROM OLD.gate THEN
+            v_change_reason := 'GATE_CHANGE';
+        ELSE
+            v_change_reason := 'OTHER_UPDATE';
+        END IF;
 
-    -- Saat UPDATE: tutup snapshot lama, buat snapshot baru
-    IF TG_OP = 'UPDATE' THEN
+        -- tutup snapshot lama
         UPDATE dxb_ops.flights_history
         SET valid_to = now()
         WHERE flight_id = OLD.flight_id
           AND valid_to IS NULL;
-
-        INSERT INTO dxb_ops.flights_history (
-            flight_id, flight_number, op_date, airline_code, origin, 
-destination,
-            std, sta, etd, eta, atd, ata, status_code, gate, stand, 
-terminal_code,
-            valid_from, valid_to, change_reason, changed_by
-        )
-        VALUES (
-            NEW.flight_id, NEW.flight_number, NEW.op_date, 
-NEW.airline_code, NEW.origin, NEW.destination,
-            NEW.std, NEW.sta, NEW.etd, NEW.eta, NEW.atd, NEW.ata, 
-NEW.status_code, NEW.gate, NEW.stand, NEW.terminal_code,
-            now(), NULL, 'UPDATE', current_user
-        );
-        RETURN NEW;
     END IF;
+
+    -- snapshot baru
+    INSERT INTO dxb_ops.flights_history (
+        flight_id, flight_number, op_date, airline_code, origin, destination,
+        std, sta, etd, eta, atd, ata, status_code, gate, stand, terminal_code,
+        valid_from, valid_to, change_reason, changed_by
+    )
+    VALUES (
+        NEW.flight_id, NEW.flight_number, NEW.op_date, NEW.airline_code,
+        NEW.origin, NEW.destination,
+        NEW.std, NEW.sta, NEW.etd, NEW.eta, NEW.atd, NEW.ata,
+        NEW.status_code, NEW.gate, NEW.stand, NEW.terminal_code,
+        now(), NULL, v_change_reason, current_user
+    );
 
     RETURN NEW;
 END;
@@ -125,6 +128,7 @@ EXECUTE FUNCTION dxb_ops.flights_live_audit();
 
 -- =========================================
 -- C. SEED DATA: AMBIL DARI public.flights
+--    (dibuat oleh 01_public_dxb_ops.sql)
 -- =========================================
 
 INSERT INTO dxb_ops.flights_live (
@@ -144,334 +148,88 @@ SELECT
     f.sta AS eta,
     f.atd,
     f.ata,
-    CASE WHEN f.atd IS NULL THEN 'SCHED' ELSE 'DEPARTED' END AS 
-status_code,
+    CASE WHEN f.atd IS NULL THEN 'SCHED' ELSE 'DEPARTED' END AS status_code,
     NULL AS gate,
     f.stand,
     f.terminal_code
 FROM public.flights f;
 
 -- Pada titik ini:
---  - dxb_ops.flights_live sudah terisi beberapa baris
---  - trigger membuat 1 baris history per INSERT
+--  - dxb_ops.flights_live terisi 6 flight
+--  - trigger sudah membuat 1 baris history per flight
 
 -- =========================================
--- D. SIMULASI PERUBAHAN (BIAR ADA HISTORY MULTI-SNAPSHOT)
+-- D. SIMULASI PERUBAHAN (BIAR ADA SNAPSHOT EXTRA)
 -- =========================================
 
--- Misal BA108 ETD di-delay 20 menit dan status berubah
+-- Contoh: BA108 delay 20 menit -> status DELAYED
 UPDATE dxb_ops.flights_live
 SET etd = etd + INTERVAL '20 minutes',
     status_code = 'DELAYED',
     last_update_ts = now()
 WHERE flight_number = 'BA108';
 
--- lalu boarding dimulai, ETD mundur lagi 10 menit
+-- Lalu boarding, ETD mundur lagi 10 menit -> status BOARDING
 UPDATE dxb_ops.flights_live
 SET etd = etd + INTERVAL '10 minutes',
     status_code = 'BOARDING',
     last_update_ts = now()
 WHERE flight_number = 'BA108';
 
-
-SELECT * 
-FROM dxb_ops.flights_history
-ORDER BY flight_id, valid_from;
-
-SELECT *
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-ORDER BY h.valid_from;
-
-SELECT
-    h.flight_number,
-    h.status_code,
-    h.etd,
-    h.valid_from,
-    h.valid_to
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-  AND h.valid_from <= TIMESTAMP '2025-11-10 09:00'
-  AND COALESCE(h.valid_to, TIMESTAMP '9999-12-31') > TIMESTAMP '2025-11-10 
-09:00'
-ORDER BY h.valid_from;
-
-
-SELECT
-    h.flight_number,
-    h.status_code,
-    h.etd,
-    h.valid_from,
-    h.valid_to
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-  AND h.valid_from <= TIMESTAMP '2025-11-10 09:00'
-  AND COALESCE(h.valid_to, TIMESTAMP '9999-12-31') > TIMESTAMP '2025-11-10 
-09:00'
-ORDER BY h.valid_from;
-
-
-SELECT
-    h.flight_number,
-    h.status_code,
-    h.etd,
-    h.valid_from,
-    h.valid_to
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-ORDER BY h.valid_from;
-
-
-SELECT
-    h.flight_number,
-    h.status_code,
-    h.etd,
-    h.valid_from,
-    h.valid_to
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-  AND h.valid_from <= TIMESTAMP '2025-11-20 20:58:00'
-  AND COALESCE(h.valid_to, TIMESTAMP '9999-12-31') > TIMESTAMP '2025-11-20 
-20:58:00'
-ORDER BY h.valid_from;
-
-
-SELECT h.flight_number, h.status_code, h.etd, h.valid_from, h.valid_to
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-ORDER BY h.valid_from;
-
-SELECT
-    h.flight_number,
-    h.status_code,
-    h.etd,
-    h.valid_from,
-    h.valid_to
-FROM dxb_ops.flights_history h
-JOIN dxb_ops.flights_live f USING (flight_id)
-WHERE f.flight_number = 'BA108'
-ORDER BY h.valid_from;
-
+-- =========================================
+-- E. HITUNG JUMLAH PERUBAHAN ETD & TOTAL SHIFT
+-- =========================================
 
 WITH ordered AS (
     SELECT
         h.flight_id,
-        f.flight_number,
-        h.valid_from,
+        h.op_date,
+        h.airline_code,
         h.etd,
+        h.valid_from,
         LAG(h.etd) OVER (
             PARTITION BY h.flight_id
             ORDER BY h.valid_from
         ) AS prev_etd
     FROM dxb_ops.flights_history h
-    JOIN dxb_ops.flights_live f USING (flight_id)
 ),
-changes AS (
+per_flight AS (
     SELECT
-        flight_number,
+        o.flight_id,
+        MIN(o.op_date)      AS op_date,
+        MIN(o.airline_code) AS airline_code,
         COUNT(*) FILTER (
-            WHERE prev_etd IS NOT NULL
-              AND etd IS DISTINCT FROM prev_etd
-        ) AS etd_change_count
-    FROM ordered
-    GROUP BY flight_number
-)
-SELECT *
-FROM changes
-ORDER BY etd_change_count DESC;
-
-WITH ordered AS (
-    SELECT
-        h.flight_id,
-        f.flight_number,
-        f.airline_code,
-        h.valid_from,
-        h.etd,
-        LAG(h.etd) OVER (
-            PARTITION BY h.flight_id
-            ORDER BY h.valid_from
-        ) AS prev_etd
-    FROM dxb_ops.flights_history h
-    JOIN dxb_ops.flights_live f USING (flight_id)
-),
-changes_per_flight AS (
-    SELECT
-        airline_code,
-        flight_number,
-        COUNT(*) FILTER (
-            WHERE prev_etd IS NOT NULL
-              AND etd IS DISTINCT FROM prev_etd
-        ) AS etd_change_count
-    FROM ordered
-    GROUP BY airline_code, flight_number
-)
-SELECT
-    airline_code,
-    AVG(etd_change_count) AS avg_etd_changes_per_flight
-FROM changes_per_flight
-GROUP BY airline_code
-ORDER BY avg_etd_changes_per_flight DESC;
-
-
-CREATE INDEX idx_flights_history_flight_validfrom
-ON dxb_ops.flights_history (flight_id, valid_from);
-
-CREATE OR REPLACE FUNCTION dxb_ops.flights_live_audit()
-RETURNS trigger AS
-$$
-DECLARE
-    v_change_reason text;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        v_change_reason := 'INSERT';
-    ELSE
-        -- deteksi jenis perubahan
-        IF NEW.etd IS DISTINCT FROM OLD.etd THEN
-            v_change_reason := 'ETD_CHANGE';
-        ELSIF NEW.status_code IS DISTINCT FROM OLD.status_code THEN
-            v_change_reason := 'STATUS_CHANGE';
-        ELSIF NEW.gate IS DISTINCT FROM OLD.gate THEN
-            v_change_reason := 'GATE_CHANGE';
-        ELSE
-            v_change_reason := 'OTHER_UPDATE';
-        END IF;
-
-        UPDATE dxb_ops.flights_history
-        SET valid_to = now()
-        WHERE flight_id = OLD.flight_id
-          AND valid_to IS NULL;
-    END IF;
-
-    INSERT INTO dxb_ops.flights_history (
-        flight_id, flight_number, op_date, airline_code, origin, 
-destination,
-        std, sta, etd, eta, atd, ata, status_code, gate, stand, 
-terminal_code,
-        valid_from, valid_to, change_reason, changed_by
-    )
-    VALUES (
-        NEW.flight_id, NEW.flight_number, NEW.op_date, NEW.airline_code, 
-NEW.origin, NEW.destination,
-        NEW.std, NEW.sta, NEW.etd, NEW.eta, NEW.atd, NEW.ata, 
-NEW.status_code, NEW.gate, NEW.stand, NEW.terminal_code,
-        now(), NULL, v_change_reason, current_user
-    );
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-
-WITH ordered AS (
-    SELECT
-        h.flight_id,
-        f.flight_number,
-        h.valid_from,
-        h.etd,
-        LAG(h.etd) OVER (
-            PARTITION BY h.flight_id
-            ORDER BY h.valid_from
-        ) AS prev_etd,
-        MIN(h.etd) OVER (PARTITION BY h.flight_id) AS first_etd,
-        MAX(h.etd) OVER (PARTITION BY h.flight_id) AS last_etd
-    FROM dxb_ops.flights_history h
-    JOIN dxb_ops.flights_live f USING (flight_id)
-),
-changes AS (
-    SELECT
-        flight_number,
-        COUNT(*) FILTER (
-            WHERE prev_etd IS NOT NULL
-              AND etd IS DISTINCT FROM prev_etd
+            WHERE o.prev_etd IS NOT NULL
+              AND o.etd IS DISTINCT FROM o.prev_etd
         ) AS etd_change_count,
-        EXTRACT(EPOCH FROM (MAX(last_etd) - MIN(first_etd)))/60 AS 
-total_etd_shift_min
-    FROM ordered
-    GROUP BY flight_number
+        EXTRACT(
+            EPOCH FROM (
+                MAX(o.etd) FILTER (WHERE o.etd IS NOT NULL)
+              - MIN(o.etd) FILTER (WHERE o.etd IS NOT NULL)
+            )
+        ) / 60 AS total_etd_shift_min
+    FROM ordered o
+    GROUP BY o.flight_id
 )
 SELECT *
-FROM changes
-ORDER BY etd_change_count DESC;
+FROM per_flight
+ORDER BY flight_id;
 
+-- =========================================
+-- F. FACT TABLE: dxb_ops.fact_flight_stability
+-- =========================================
 
-WITH flight_stability AS (
-    SELECT
-        flight_number,
-        etd_change_count,
-        total_etd_shift_min,
-        LEAST(100,
-              100
-              - 10 * etd_change_count
-              - 0.5 * GREATEST(total_etd_shift_min, 0)
-        ) AS stability_score
-    FROM (
-        -- subquery previous changes (reuse dari query di atas)
-        WITH ordered AS (
-            SELECT
-                h.flight_id,
-                f.flight_number,
-                h.valid_from,
-                h.etd,
-                LAG(h.etd) OVER (
-                    PARTITION BY h.flight_id
-                    ORDER BY h.valid_from
-                ) AS prev_etd,
-                MIN(h.etd) OVER (PARTITION BY h.flight_id) AS first_etd,
-                MAX(h.etd) OVER (PARTITION BY h.flight_id) AS last_etd
-            FROM dxb_ops.flights_history h
-            JOIN dxb_ops.flights_live f USING (flight_id)
-        )
-        SELECT
-            flight_number,
-            COUNT(*) FILTER (
-                WHERE prev_etd IS NOT NULL
-                  AND etd IS DISTINCT FROM prev_etd
-            ) AS etd_change_count,
-            EXTRACT(EPOCH FROM (MAX(last_etd) - MIN(first_etd)))/60 AS 
-total_etd_shift_min
-        FROM ordered
-        GROUP BY flight_number
-    ) t
-)
-SELECT *
-FROM flight_stability
-ORDER BY stability_score ASC;
-
-
-CREATE TABLE IF NOT EXISTS dxb_ops.fact_flight_stability (
-    op_date        DATE,
-    flight_number  VARCHAR(10),
-    airline_code   VARCHAR(5),
-    etd_change_count INT,
-    total_etd_shift_min NUMERIC,
-    stability_score NUMERIC,
+CREATE TABLE dxb_ops.fact_flight_stability (
+    op_date             DATE        NOT NULL,
+    flight_number       VARCHAR(10) NOT NULL,
+    airline_code        VARCHAR(5)  NOT NULL,
+    etd_change_count    INT         NOT NULL,
+    total_etd_shift_min NUMERIC     NOT NULL,
+    stability_score     NUMERIC     NOT NULL,
     PRIMARY KEY (op_date, flight_number)
 );
 
-
--- =========================================================
--- FACT: FLIGHT STABILITY
--- =========================================================
-
-CREATE SCHEMA IF NOT EXISTS dxb_ops;
-
-CREATE TABLE IF NOT EXISTS dxb_ops.fact_flight_stability (
-    op_date            DATE,
-    flight_number      VARCHAR(10),
-    airline_code       VARCHAR(5),
-    etd_change_count   INT,
-    total_etd_shift_min NUMERIC,
-    stability_score    NUMERIC,
-    PRIMARY KEY (op_date, flight_number)
-);
-
--- 1) Refresh isi fact dari flights_history
+-- refresh isi fact dari flights_history
 TRUNCATE TABLE dxb_ops.fact_flight_stability;
 
 WITH ordered AS (
@@ -517,8 +275,8 @@ SELECT
     pf.op_date,
     f.flight_number,
     pf.airline_code,
-    COALESCE(pf.etd_change_count, 0)        AS etd_change_count,
-    COALESCE(pf.total_etd_shift_min, 0)     AS total_etd_shift_min,
+    COALESCE(pf.etd_change_count, 0)    AS etd_change_count,
+    COALESCE(pf.total_etd_shift_min, 0) AS total_etd_shift_min,
     LEAST(
         100,
         100
@@ -528,20 +286,22 @@ SELECT
 FROM per_flight pf
 JOIN dxb_ops.flights_live f USING (flight_id);
 
--- 2) Summary per airline (hasil yang tadi kamu kirim)
+-- =========================================
+-- G. RINGKASAN & DETAIL
+-- =========================================
+
+-- 1) Summary per airline (dipakai di Jupyter untuk bar chart)
 SELECT
     airline_code,
-    COUNT(*)                    AS flights,
-    AVG(etd_change_count)       AS avg_etd_changes,
-    AVG(total_etd_shift_min)    AS avg_shift_min,
-    AVG(stability_score)        AS avg_stability_score
+    COUNT(*)                 AS flights,
+    AVG(etd_change_count)    AS avg_etd_changes,
+    AVG(total_etd_shift_min) AS avg_shift_min,
+    AVG(stability_score)     AS avg_stability_score
 FROM dxb_ops.fact_flight_stability
 GROUP BY airline_code
 ORDER BY avg_stability_score ASC;
 
--- 3) (Opsional) detail per flight untuk analisis lebih dalam
+-- 2) Detail per flight
 SELECT *
 FROM dxb_ops.fact_flight_stability
 ORDER BY stability_score ASC;
-
-
