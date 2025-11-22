@@ -1,20 +1,17 @@
 # DXB Operations & Engineering Procurement – SQL Lab
 
 Author: [@barata90](https://github.com/barata90)  
-Tech stack: PostgreSQL, DBeaver, Advanced SQL (CTEs, window functions, 
-triggers)
+Tech stack: PostgreSQL, DBeaver, Advanced SQL (CTEs, window functions, triggers)
 
-This project is a mini data mart built in PostgreSQL to simulate **Dubai 
-International Airport (DXB)** operations and **engineering procurement 
-analytics**.
+This project is a mini data mart built in PostgreSQL to simulate **Dubai International Airport (DXB)** operations 
+and **engineering procurement analytics**.
 
 It is designed as a **portfolio-style project** to demonstrate:
 
 - solid SQL modelling and schema design,  
 - advanced querying (window functions, CTEs, analytic aggregates),  
 - trigger-based history (SCD2-style) for operational data, and  
-- how to translate data into concrete business insights for **airport 
-operations** and **procurement**.
+- how to translate data into concrete business insights for **airport operations** and **procurement**.
 
 ---
 
@@ -38,8 +35,7 @@ The database is split into three main schemas:
    - Part failures / AOG interruptions
    - Part usage and Life-Cycle Cost (LCC) scenarios
 
-The goal is to mimic realistic problems an analyst or data engineer would 
-face in an airline / MRO context.
+The goal is to mimic realistic problems an analyst or data engineer would face in an airline / MRO context.
 
 ---
 
@@ -51,13 +47,11 @@ Key tables (simplified):
 
 - `flights`
   - One row per movement at DXB  
-  - Columns: `flight_number`, `airline_code`, `origin`, `destination`,  
-    scheduled/estimated/actual departure & arrival (`std`, `sta`, `etd`, 
-`eta`, `atd`, `ata`), `stand`, `terminal_code`.
+  - Columns: `flight_number`, `airline_code`, `origin`, `destination`,  scheduled/estimated/actual departure & arrival
+    (`std`, `sta`, `etd`, `eta`, `atd`, `ata`), `stand`, `terminal_code`.
 
 - `turnaround_events`
-  - Milestones for ground handling (e.g. `DOCK_ON`, `BOARDING_START`, 
-`CLEANING_COMPLETE`).
+  - Milestones for ground handling (e.g. `DOCK_ON`, `BOARDING_START`, `CLEANING_COMPLETE`).
   - Columns: `flight_id`, `event_type`, `event_time`, `workcentre`.
 
 - `baggage_scans`
@@ -68,14 +62,12 @@ Key tables (simplified):
   - Lost / delayed / damaged baggage records.
 
 - `rosters`
-  - Staff rosters with `staff_id`, `role` (e.g. `RAMP_AGENT`, 
-`BAGGAGE_AGENT`), `terminal`, `shift_start`, `shift_end`.
+  - Staff rosters with `staff_id`, `role` (e.g. `RAMP_AGENT`, `BAGGAGE_AGENT`), `terminal`, `shift_start`, `shift_end`.
 
 - `flight_task_requirements`
   - Required manpower per flight, per role, per time window.
 
-Together these tables represent a simplified but realistic DXB 
-hub-operation model.
+Together these tables represent a simplified but realistic DXB hub-operation model.
 
 ---
 
@@ -83,14 +75,12 @@ hub-operation model.
 
 - `flights_live`
   - Current state of each flight at DXB.
-  - Contains operational date, airline, origin/destination, all 
-schedule/estimate/actual times and current `status_code` (e.g. `SCHED`, 
-`BOARDING`, `DEPARTED`).
+  - Contains operational date, airline, origin/destination, all schedule/estimate/actual times
+    and current `status_code` (e.g. `SCHED`, `BOARDING`, `DEPARTED`).
 
 - `flights_history`
   - **SCD2-style history** of `flights_live`.
-  - Every insert/update on `flights_live` writes a snapshot row with 
-`valid_from`, `valid_to`, `change_reason`, `changed_by`.
+  - Every insert/update on `flights_live` writes a snapshot row with `valid_from`, `valid_to`, `change_reason`, `changed_by`.
 
 - `fact_flight_stability`
   - Aggregated snapshot per flight/day containing:
@@ -103,13 +93,11 @@ schedule/estimate/actual times and current `status_code` (e.g. `SCHED`,
 A PL/pgSQL trigger `dxb_ops.flights_live_audit`:
 
 - On **INSERT** → creates the initial history row.  
-- On **UPDATE** → closes the previous history row (`valid_to = now()`) 
-and inserts a new one.  
+- On **UPDATE** → closes the previous history row (`valid_to = now()`) and inserts a new one.  
 - Optionally labels `change_reason` as:
   - `ETD_CHANGE`, `STATUS_CHANGE`, `GATE_CHANGE`, or `OTHER_UPDATE`.
 
-This simulates an operational system where ATC / OCC continuously updates 
-flight times and statuses.
+This simulates an operational system where ATC / OCC continuously updates flight times and statuses.
 
 ---
 
@@ -134,12 +122,10 @@ Key tables:
   - Unplanned events (e.g. AOG) linked to flights and root causes.
 
 - `part_usage_monthly`
-  - Aggregated usage statistics: flight hours, cycles, removals per part 
-per month.
+  - Aggregated usage statistics: flight hours, cycles, removals per part per month.
 
 - `lcc_scenarios`
-  - Parameters to run **Life-Cycle Cost** scenarios per part & supplier 
-option:
+  - Parameters to run **Life-Cycle Cost** scenarios per part & supplier option:
     - `fh_per_failure` (MTBUR)
     - Base `unit_price`
     - `annual_esc_pct` (price escalation)
@@ -147,8 +133,7 @@ option:
     - `discount_rate` and horizon in years
 
 This schema allows realistic engineering & procurement analysis such as 
-**reliability**, **supplier performance**, and **total cost of 
-ownership**.
+**reliability**, **supplier performance**, and **total cost of ownership**.
 
 ---
 
@@ -157,59 +142,46 @@ ownership**.
 ### 3.1 Flight schedule stability (DXB operations)
 
 **Business question:**  
-> Which flights and airlines have the most unstable ETD (many changes / 
-big shifts)?
+> Which flights and airlines have the most unstable ETD (many changes / big shifts)?
 
 **Approach:**
 
 1. Use `flights_history` as a temporal table.
-2. Use window functions (e.g. `LAG`) by `flight_id` ordered by 
-`valid_from` to detect each ETD change.
+2. Use window functions (e.g. `LAG`) by `flight_id` ordered by `valid_from` to detect each ETD change.
 3. For each flight:
    - Count ETD changes → `etd_change_count`
-   - Compute `total_etd_shift_min` = difference between earliest and 
-latest ETD.
+   - Compute `total_etd_shift_min` = difference between earliest and latest ETD.
 4. Calculate a simple **stability_score**:
    - Start at 100
    - Subtract points per change and per minute of total shift.
 
 Example output (per flight):
 
-| op_date    | flight_number | airline_code | etd_change_count | 
-total_etd_shift_min | stability_score |
-|-----------|---------------|--------------|------------------|---------------------|-----------------|
-| 2025-11-10 | BA108         | BA           | 2                | 30                  
-| 65              |
-| 2025-11-10 | EK202         | EK           | 0                | 0                   
-| 100             |
+| op_date    | flight_number | airline_code | etd_change_count | total_etd_shift_min | stability_score |
+|----------- |---------------|--------------|------------------|---------------------|-----------------|
+| 2025-11-10 | BA108         | BA           | 2                | 30                  | 65              |
+| 2025-11-10 | EK202         | EK           | 0                | 0                   | 100             |
 
 Example aggregation (per airline):
 
-| airline_code | flights | avg_etd_changes | avg_shift_min | 
-avg_stability_score |
+| airline_code | flights | avg_etd_changes | avg_shift_min | avg_stability_score |
 |--------------|---------|-----------------|---------------|---------------------|
-| BA           | 1       | 2.0             | 30.0          | 65.0                
-|
-| EK, QR, SQ   | …       | 0.0             | 0.0           | 100.0               
-|
+| BA           | 1       | 2.0             | 30.0          | 65.0                |
+| EK, QR, SQ   | …       | 0.0             | 0.0           | 100.0               |
 
-This can be used as a **flight or airline scorecard** in operational 
-performance reviews.
+This can be used as a **flight or airline scorecard** in operational performance reviews.
 
 ---
 
 ### 3.2 Manpower vs demand (ground handling)
 
 **Business question:**  
-> During the morning wave at DXB, where are we under-staffed by role and 
-hour?
+> During the morning wave at DXB, where are we under-staffed by role and hour?
 
 **Approach:**
 
-1. From `flight_task_requirements`, aggregate **required staff** per 
-`ops_date`, `hour_slot`, `role`.
-2. From `rosters`, aggregate **available staff** per `shift_date`, 
-`hour_slot`, `role`.
+1. From `flight_task_requirements`, aggregate **required staff** per `ops_date`, `hour_slot`, `role`.
+2. From `rosters`, aggregate **available staff** per `shift_date`, `hour_slot`, `role`.
 3. Left join demand vs supply to compute:
    - `staffing_gap = available_staff - total_required_staff`
    - Categorise each hour & role into:
@@ -220,26 +192,20 @@ hour?
 
 Example output:
 
-| ops_date   | hour_slot           | role           | total_required_staff 
-| available_staff | staffing_gap |
-|-----------|---------------------|----------------|----------------------|-----------------|--------------|
-| 2025-11-10 | 05:00–06:00         | BAGGAGE_AGENT  | 4                    
-| 1               | -3           |
-| 2025-11-10 | 05:00–06:00         | RAMP_AGENT     | 5                    
-| 1               | -4           |
-| 2025-11-10 | 09:00–10:00         | BAGGAGE_AGENT  | 3                    
-| 0               | -3           |
+| ops_date   | hour_slot           | role           | total_required_staff | available_staff | staffing_gap |
+|----------- |---------------------|----------------|----------------------|-----------------|--------------|
+| 2025-11-10 | 05:00–06:00         | BAGGAGE_AGENT  | 4                    | 1               | -3           |
+| 2025-11-10 | 05:00–06:00         | RAMP_AGENT     | 5                    | 1               | -4           |
+| 2025-11-10 | 09:00–10:00         | BAGGAGE_AGENT  | 3                    | 0               | -3           |
 
-This directly pinpoints **when and where** management should add staff or 
-adjust shift patterns.
+This directly pinpoints **when and where** management should add staff or adjust shift patterns.
 
 ---
 
 ### 3.3 Procurement Life-Cycle Cost (LCC) for aircraft parts
 
 **Business question:**  
-> For a safety-critical part (e.g. A380 brake), which supplier option is 
-cheaper over a 10-year horizon?
+> For a safety-critical part (e.g. A380 brake), which supplier option is cheaper over a 10-year horizon?
 
 **Approach:**
 
@@ -258,26 +224,23 @@ cheaper over a 10-year horizon?
      - Interruption cost (e.g. AOG)
    - Apply annual price escalation and discount factor.
 
-4. Compute **NPV of total cost** per scenario in pure SQL (CTEs + window 
-functions).
+4. Compute **NPV of total cost** per scenario in pure SQL (CTEs + window functions).
 
 Example comparative result (approximate):
 
-| scenario_name   | part_number | supplier_name  | npv_total_cost |
-|----------------|-------------|----------------|----------------|
-| OEM_A baseline | BRAKE-A380  | OEM Aero Systems | 3.47M         |
-| MRO_X aggressive | BRAKE-A380 | MRO X Dubai      | 3.94M         |
+| scenario_name   | part_number | supplier_name    | npv_total_cost |
+|---------------- |-------------|----------------  |----------------|
+| OEM_A baseline  | BRAKE-A380  | OEM Aero Systems | 3.47M          |
+| MRO_X aggressive| BRAKE-A380  | MRO X Dubai      | 3.94M          |
 
 Although the MRO option may look cheaper on a per-event basis, once we 
-factor in reliability and interruption costs, the OEM baseline is **~470k 
-cheaper over the life-cycle**.
+factor in reliability and interruption costs, the OEM baseline is **~470k cheaper over the life-cycle**.
 
-This is exactly the type of analysis a **Procurement Analyst – 
-Engineering** role would perform.
+This is exactly the type of analysis a **Procurement Analyst – Engineering** role would perform.
 
 ---
 
-## 4. Repository Structure (suggested)
+## 4. Repository Structure
 
 ```text
 ├── sql/
