@@ -1,0 +1,5 @@
+// Schema public
+digraph {
+	graph [rankdir=LR]
+	node [shape=plaintext]
+}
